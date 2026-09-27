@@ -2529,10 +2529,9 @@ bao kv put vendor-clients/acmehub client_id=… private_key=@key.pem alg=RS256
 </tbody>
 </table>
 <p>The real-service checks ran against the gateway before <code>disconnect_&lt;service&gt;</code> existed. Disconnect is covered by the unit suite and the gateway profile, against the stand-ins.</p>
-<h3 id="known-flaky-test">Known flaky test</h3>
-<p>The 20-parallel single-flight test in the multi-replica suite occasionally sees 2 refreshes instead of 1. Rerunning it passes.</p>
-<p>This is a timing race in the test, not a single-flight bug. Mock tokens last 60 seconds, which is inside <code>REFRESH_BUFFER_S</code> (300). So a resolve whose first read lands after the first refresh finishes correctly refreshes again.</p>
-<p>A multi-replica run right after a standalone Redis broker can also fail, most likely because that broker keeps its 120-second sweep lease, longer than the test's 60-second deadline. The documented <a href="#run-the-automated-checks">test isolation</a> avoids this handoff problem.</p>
+<h3 id="how-the-single-flight-tests-stay-exact">How the single-flight tests stay exact</h3>
+<p>The 20-parallel single-flight tests (single replica and through the load balancer) expect exactly one vendor refresh. Mock tokens normally last 60 seconds, inside <code>REFRESH_BUFFER_S</code> (300), so a request that starts after the first refresh finished would correctly refresh again. For the burst, the tests switch the mock vendor to 1-hour tokens: the consent's 60-second token forces the one refresh, and every later request is served the new token.</p>
+<p>A multi-replica run right after a standalone Redis broker can fail if that broker still holds its 120-second sweep lease, longer than the test's 60-second deadline. The documented <a href="#run-the-automated-checks">test isolation</a> avoids this.</p>
 <h3 id="what-these-checks-do-not-show">What these checks do not show</h3>
 <ul>
 <li>Most checks use the mock vendor and the stand-ins.</li>
@@ -3180,7 +3179,10 @@ browser. (Full sequence diagram: <code>token-lifecycle.md</code> §1. Route deta
 <li>The browser returns to <code>/v1/callback/{vendor}?code&amp;state&amp;iss</code>.</li>
 <li>The broker checks state, iss, and binding, uses up the state, and
    redeems the code on the server (with <code>resource</code> when set).</li>
-<li>The broker writes the entry as <code>ACTIVE gen=1</code>.</li>
+<li>The broker writes the entry as <code>ACTIVE gen=1</code>, holding the entry's
+   refresh lock for that write. If the lock doesn't free within
+   <code>LOCK_TIMEOUT_S</code>, it writes anyway: the code is spent, and losing the
+   new grant would be worse.</li>
 <li>The browser shows a "connected" page.</li>
 <li>The caller retries, and resolve returns 200.</li>
 </ol>
@@ -3422,12 +3424,16 @@ consecutive passes.</p>
   entries, starting where the previous pass stopped. A vendor whose
   listing fails (custody down) is skipped for that pass. Entries the
   budget skips are still refreshed lazily by resolve.</li>
-<li><strong>REVOKE_PENDING retry.</strong> The sweeper calls the vendor revoke with the
-  pair it read. It does not take the refresh lock and does not CAS: on
-  success, or when the vendor has no revocation endpoint, it deletes the
-  entry and drops it from every cache, and audits <code>broker.revoke</code> with
-  <code>path: sweep-retry</code>. If the vendor is still down, it leaves the entry
-  for the next pass.</li>
+<li><strong>REVOKE_PENDING retry.</strong> The sweeper takes the entry's refresh lock
+  without waiting and skips the entry if someone holds it. Under the lock
+  it re-reads the entry and calls the vendor revoke with that pair. On
+  success, or when the vendor has no revocation endpoint, it re-reads once
+  more and deletes the entry only if its version is unchanged, then drops
+  it from every cache and audits <code>broker.revoke</code> with <code>path: sweep-retry</code>.
+  Custody has no conditional delete, so this check plus the lock (which
+  consent also holds while it writes) keeps the sweeper from deleting a
+  grant written meanwhile. If the vendor is still down, it leaves the
+  entry for the next pass.</li>
 <li><strong>Refresh band.</strong> An ACTIVE entry with <code>REFRESH_BUFFER_S &lt; remaining ≤
   PROACTIVE_REFRESH_S</code>, or a REFRESHING marker older than
   <code>REFRESHING_TTL_S</code>, is refreshed under the lock. The sweeper takes the
@@ -4006,8 +4012,9 @@ them.</p>
     loop each entry, up to SWEEP_MAX_ENTRIES per pass (round-robin cursor)
         S-&gt;&gt;K: read entry
         alt state REVOKE_PENDING
-            S-&gt;&gt;V: retry revoke (no lock, no CAS)
-            Note over S: success or unsupported: delete entry,&lt;br/&gt;audit broker.revoke {path: sweep-retry}.&lt;br/&gt;Vendor still down: try next pass
+            S-&gt;&gt;B: try_lock (no waiting, skip if held)
+            S-&gt;&gt;V: re-read under lock, retry revoke
+            Note over S: success or unsupported: delete only if&lt;br/&gt;the version is unchanged, audit broker.revoke&lt;br/&gt;{path: sweep-retry}. Vendor still down: next pass
         else REFRESHING abandoned (≥ REFRESHING_TTL_S) or ACTIVE and 300 &lt; remaining ≤ 900
             S-&gt;&gt;B: try_lock (no waiting, a resolve may hold it)
             B-&gt;&gt;K: re-read under lock
@@ -4239,12 +4246,14 @@ from custody.</p>
     participant K as Custody
 
     loop each sweep pass until the vendor recovers
+        Note over S: take the entry lock without waiting,&lt;br/&gt;skip this pass if it is held
         S-&gt;&gt;K: read entry, state REVOKE_PENDING
-        S-&gt;&gt;V: retry revoke (no lock, no CAS)
+        S-&gt;&gt;V: retry revoke
     end
     V--&gt;&gt;S: 200
+    S-&gt;&gt;K: re-read, version unchanged?
     S-&gt;&gt;K: delete entry
-    Note over S: audit broker.revoke {path: sweep-retry}
+    Note over S: audit broker.revoke {path: sweep-retry}.&lt;br/&gt;If a new grant landed meanwhile,&lt;br/&gt;the sweeper leaves it alone
 </pre>
 <p>If the user connects again while the entry is <code>REVOKE_PENDING</code>, the
 consent callback revokes and removes it first (<code>path: reconsent</code>). If the
