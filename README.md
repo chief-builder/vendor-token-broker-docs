@@ -6,3 +6,5 @@ lifecycle, smoke tests). Generated from the source repository's
 regenerate and re-push from the source repo.
 
 Site: https://chief-builder.github.io/vendor-token-broker-docs/
+
+Source: https://github.com/chief-builder/vendor-token-broker
